@@ -1,0 +1,5 @@
+PyAudioWPatch
+PySide6 
+python-dotenv 
+openai
+pydub
