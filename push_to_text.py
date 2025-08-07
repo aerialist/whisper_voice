@@ -4,6 +4,7 @@ import os
 import threading
 import time
 import platform
+from datetime import datetime
 
 # Platform-specific imports
 if platform.system() == "Windows":
@@ -36,9 +37,10 @@ from util_audio import (
 load_dotenv()
 
 class AudioRecorder:
-    def __init__(self, device_id, p):
+    def __init__(self, device_id, p, device_name=None):
         self.device_id = device_id
         self.p = p
+        self.device_name = device_name or f"device_{device_id}"
         self.stream = None
         self.recording = False
         self.frames = []
@@ -129,6 +131,37 @@ class AudioRecorder:
             return True
         except Exception as e:
             return False
+    
+    def save_to_recordings_folder(self):
+        """Save recorded audio to recordings folder with timestamp and device name"""
+        if not self.frames:
+            return False, "No audio data to save"
+        
+        try:
+            # Create recordings directory if it doesn't exist
+            recordings_dir = "recordings"
+            if not os.path.exists(recordings_dir):
+                os.makedirs(recordings_dir)
+            
+            # Generate filename with timestamp and device name
+            timestamp = datetime.now().strftime("%Y%m%d%H%M")
+            # Sanitize device name for filename
+            safe_device_name = "".join(c for c in self.device_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
+            safe_device_name = safe_device_name.replace(" ", "_")
+            filename = f"{timestamp}_{safe_device_name}.wav"
+            filepath = os.path.join(recordings_dir, filename)
+            
+            # Save the file
+            wf = wave.open(filepath, 'wb')
+            wf.setnchannels(self.channels)
+            wf.setsampwidth(self.p.get_sample_size(pyaudio.paInt16))
+            wf.setframerate(self.sample_rate)
+            wf.writeframes(b''.join(self.frames))
+            wf.close()
+            
+            return True, filepath
+        except Exception as e:
+            return False, str(e)
 
 class AudioMonitor:
     def __init__(self, device_id, p, callback):
@@ -544,7 +577,8 @@ class MainWindow(QMainWindow):
             self.monitor.stop_monitoring()
             self.log_message("Stopped audio monitoring during recording")
 
-        self.recorder = AudioRecorder(device_id, self.p)
+        device_name = self.device_combo.currentText()
+        self.recorder = AudioRecorder(device_id, self.p, device_name)
         result = self.recorder.start_recording()
 
         if result is True:
@@ -591,6 +625,14 @@ class MainWindow(QMainWindow):
             self.reset_button()
             return
 
+        # Save to recordings folder first
+        success, result = self.recorder.save_to_recordings_folder()
+        if success:
+            self.log_message(f"Audio saved to: {result}")
+        else:
+            self.log_message(f"Failed to save recording: {result}")
+
+        # Also create temp file for transcription
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
         temp_file.close()
 
@@ -706,38 +748,26 @@ if __name__ == "__main__":
             app.setApplicationDisplayName("Push to Text")
             app.setQuitOnLastWindowClosed(True)
         
-        print("Creating MainWindow...")
         window = MainWindow()
-        print("MainWindow created successfully")
-        print(f"Window geometry: {window.geometry()}")
-        print(f"Window is visible: {window.isVisible()}")
-        print(f"Window is hidden: {window.isHidden()}")
         
         # macOS-specific window visibility fixes
         if platform.system() == "Darwin":
-            print("Applying macOS-specific window visibility fixes...")
             # Set window flags to ensure it appears
             window.setWindowFlags(window.windowFlags() | Qt.WindowStaysOnTopHint)
             window.show()
-            print(f"After first show - visible: {window.isVisible()}, hidden: {window.isHidden()}")
             window.setWindowFlags(window.windowFlags() & ~Qt.WindowStaysOnTopHint)
             window.show()
-            print(f"After second show - visible: {window.isVisible()}, hidden: {window.isHidden()}")
             window.raise_()
             window.activateWindow()
             app.processEvents()
-            print("Window should now be visible")
             
             # Force application to front
-            print("Forcing application to front...")
             import subprocess
             subprocess.run(['osascript', '-e', 'tell application "System Events" to set frontmost of first process whose unix id is {} to true'.format(os.getpid())], check=False)
         else:
             window.show()
         
-        print("Starting application event loop...")
         app.exec()
-        print("Application finished")
         
     except Exception as e:
         print(f"ERROR: {e}")
