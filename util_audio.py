@@ -1,5 +1,11 @@
 import json
-import pyaudiowpatch as pyaudio
+import platform
+
+# Platform-specific imports
+if platform.system() == "Windows":
+    import pyaudiowpatch as pyaudio
+else:
+    import pyaudio
 
 # Standard list of sample rates.
 STANDARD_SAMPLE_RATES = [
@@ -225,7 +231,12 @@ def get_wasapi_info(p=None, standard_sample_rates=None):
       - 'output_devices': A list of WASAPI devices that support output.
     
     If no PyAudio instance is provided, one is created internally.
+    Returns None on macOS since WASAPI is Windows-only.
     """
+    # WASAPI is Windows-only
+    if platform.system() != "Windows":
+        return None
+        
     created = False
     if p is None:
         p = pyaudio.PyAudio()
@@ -484,7 +495,12 @@ def get_wasapi_default_output_loopback_device(p=None):
     Returns the default WASAPI loopback output device info.
     
     If no PyAudio instance is provided, one is created internally.
+    Returns None on macOS since WASAPI is Windows-only.
     """
+    # WASAPI is Windows-only
+    if platform.system() != "Windows":
+        return None
+        
     created = False
     if p is None:
         p = pyaudio.PyAudio()
@@ -512,7 +528,12 @@ def get_wasapi_default_input_device(p=None):
     Returns the default WASAPI input device info.
     
     If no PyAudio instance is provided, one is created internally.
+    Returns None on macOS since WASAPI is Windows-only.
     """
+    # WASAPI is Windows-only
+    if platform.system() != "Windows":
+        return None
+        
     created = False
     if p is None:
         p = pyaudio.PyAudio()
@@ -528,6 +549,117 @@ def get_wasapi_default_input_device(p=None):
         p.terminate()
     return default_input
 
+# Cross-platform device helper functions
+
+def get_coreaudio_devices_info(p=None, standard_sample_rates=None):
+    """
+    Returns only the Core Audio devices information as a dictionary with keys:
+      - 'input': list of Core Audio input devices.
+      - 'output': list of Core Audio output devices.
+    
+    This function filters the devices retrieved from get_devices_info() by the host API name "Core Audio".
+    Returns empty lists on non-macOS platforms.
+    
+    Args:
+        p: An instance of PyAudio (optional).
+        standard_sample_rates: List of sample rates to test (optional).
+    
+    Returns:
+        A dictionary with keys 'input' and 'output' containing lists of device info dictionaries.
+    """
+    if platform.system() != "Darwin":
+        return {"input": [], "output": []}
+        
+    devices_info = get_devices_info(p, standard_sample_rates)
+    coreaudio_input = [dev for dev in devices_info.get("input", [])
+                      if dev.get("hostApiName", "").lower() == "core audio"]
+    coreaudio_output = [dev for dev in devices_info.get("output", [])
+                       if dev.get("hostApiName", "").lower() == "core audio"]
+    return {"input": coreaudio_input, "output": coreaudio_output}
+
+def get_coreaudio_input_device_id_by_name(device_name, p=None, standard_sample_rates=None):
+    """
+    Searches Core Audio input devices for a device whose 'name' matches the provided
+    device_name (case-insensitive) and returns its device index.
+
+    If no matching device is found, returns None.
+    Returns None on non-macOS platforms.
+
+    Args:
+        device_name: The device name string to match.
+        p: An instance of PyAudio (optional).
+        standard_sample_rates: List of sample rates to test (optional).
+    """
+    if platform.system() != "Darwin":
+        return None
+        
+    devices_info = get_devices_info(p, standard_sample_rates)
+    input_devices = devices_info.get("input", [])
+    for dev in input_devices:
+        if dev.get("hostApiName", "").lower() == "core audio" and dev.get("name", "").lower() == device_name.lower():
+            return dev.get("index")
+    return None
+
+def get_coreaudio_output_device_id_by_name(device_name, p=None, standard_sample_rates=None):
+    """
+    Searches Core Audio output devices for a device whose 'name' matches the provided
+    device_name (case-insensitive) and returns its device index.
+
+    If no matching device is found, returns None.
+    Returns None on non-macOS platforms.
+
+    Args:
+        device_name: The device name string to match.
+        p: An instance of PyAudio (optional).
+        standard_sample_rates: List of sample rates to test (optional).
+    """
+    if platform.system() != "Darwin":
+        return None
+        
+    devices_info = get_devices_info(p, standard_sample_rates)
+    output_devices = devices_info.get("output", [])
+    for dev in output_devices:
+        if dev.get("hostApiName", "").lower() == "core audio" and dev.get("name", "").lower() == device_name.lower():
+            return dev.get("index")
+    return None
+
+def get_default_input_device_cross_platform(p=None):
+    """
+    Returns the default input device for the current platform.
+    
+    On Windows: Attempts to get WASAPI default input device first, falls back to system default.
+    On macOS: Gets the system default input device.
+    On other platforms: Gets the system default input device.
+    """
+    if platform.system() == "Windows":
+        wasapi_device = get_wasapi_default_input_device(p)
+        if wasapi_device:
+            return wasapi_device
+    
+    # Fall back to system default
+    default_devices = get_default_devices(p)
+    return default_devices.get("input")
+
+def get_platform_devices_info(p=None, standard_sample_rates=None):
+    """
+    Returns device information for the current platform's preferred audio API.
+    
+    On Windows: Returns WASAPI devices if available, falls back to all devices.
+    On macOS: Returns Core Audio devices if available, falls back to all devices.
+    On other platforms: Returns all devices.
+    """
+    if platform.system() == "Windows":
+        wasapi_devices = get_wasapi_devices_info(p, standard_sample_rates)
+        if wasapi_devices and (wasapi_devices.get("input") or wasapi_devices.get("output")):
+            return wasapi_devices
+    elif platform.system() == "Darwin":
+        coreaudio_devices = get_coreaudio_devices_info(p, standard_sample_rates)
+        if coreaudio_devices and (coreaudio_devices.get("input") or coreaudio_devices.get("output")):
+            return coreaudio_devices
+    
+    # Fall back to all devices
+    return get_devices_info(p, standard_sample_rates)
+
 def get_all_audio_data(p=None):
     """
     Wraps all individual functions into one function that returns the complete audio data.
@@ -537,7 +669,9 @@ def get_all_audio_data(p=None):
       - 'host_apis'
       - 'default_devices'
       - 'devices'  (divided into 'input' and 'output' lists)
-      - 'wasapi'
+      - 'wasapi' (Windows only)
+      - 'coreaudio' (macOS only)
+      - 'platform_devices' (preferred API for current platform)
     
     If no PyAudio instance is provided, one is created internally.
     """
@@ -551,13 +685,17 @@ def get_all_audio_data(p=None):
     default_devices = get_default_devices(p, STANDARD_SAMPLE_RATES)
     devices = get_devices_info(p, STANDARD_SAMPLE_RATES)
     wasapi = get_wasapi_info(p, STANDARD_SAMPLE_RATES)
+    coreaudio = get_coreaudio_devices_info(p, STANDARD_SAMPLE_RATES)
+    platform_devices = get_platform_devices_info(p, STANDARD_SAMPLE_RATES)
     
     total_data = {
         "portaudio": portaudio,
         "host_apis": host_apis,
         "default_devices": default_devices,
         "devices": devices,
-        "wasapi": wasapi
+        "wasapi": wasapi,
+        "coreaudio": coreaudio,
+        "platform_devices": platform_devices
     }
     
     if created:

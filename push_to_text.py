@@ -3,7 +3,13 @@ import tempfile
 import os
 import threading
 import time
-import pyaudiowpatch as pyaudio
+import platform
+
+# Platform-specific imports
+if platform.system() == "Windows":
+    import pyaudiowpatch as pyaudio
+else:
+    import pyaudio
 import openai
 from dotenv import load_dotenv
 import numpy as np
@@ -11,7 +17,7 @@ import pyqtgraph as pg
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
-from PySide6.QtCore import QRunnable, QThreadPool, Signal, QObject
+from PySide6.QtCore import QRunnable, QThreadPool, Signal, QObject, Qt
 from PySide6.QtCore import QThread, Signal, QObject, Slot, QEvent, QTimer
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
@@ -19,12 +25,12 @@ from PySide6.QtWidgets import (
     QLabel, QComboBox, QPushButton, QMessageBox, QSizePolicy, QTextEdit
 )
 
-VERSION = "20250806"
+VERSION = "20250807"
 
 from util_audio import (
-    get_wasapi_devices_info,
+    get_platform_devices_info,
     get_device_info_by_id,
-    get_wasapi_default_input_device,
+    get_default_input_device_cross_platform,
 )
 
 load_dotenv()
@@ -131,18 +137,24 @@ class AudioMonitor:
         self.callback = callback
         self.stream = None
         self.monitoring = False
+        self.latest_audio_data = None
+        self.latest_sample_rate = None
         
     def start_monitoring(self):
         """Start monitoring audio for real-time visualization"""
         try:
             device_info = get_device_info_by_id(self.device_id, self.p)
             if not device_info:
+                print(f"Device {self.device_id} not found for monitoring")
                 return False
             
             self.sample_rate = int(device_info.get('defaultSampleRate', 44100))
             self.channels = min(int(device_info.get('maxInputChannels', 2)), 2)
             self.chunk = 1024
             
+            print(f"Opening audio stream for monitoring - device: {self.device_id}, rate: {self.sample_rate}, channels: {self.channels}")
+            
+            # Add timeout and error handling for macOS microphone permission issues
             self.stream = self.p.open(
                 format=pyaudio.paInt16,
                 channels=self.channels,
@@ -153,10 +165,13 @@ class AudioMonitor:
                 stream_callback=self._audio_callback
             )
             
+            print("Audio stream opened successfully")
             self.monitoring = True
             self.stream.start_stream()
+            print("Audio monitoring started")
             return True
         except Exception as e:
+            print(f"Audio monitoring failed: {e}")
             return False
     
     def _audio_callback(self, in_data, frame_count, time_info, status):
@@ -170,8 +185,11 @@ class AudioMonitor:
                 if self.channels == 2:
                     audio_data = audio_data[0::2]
                 
-                # Only call callback without debug spam
-                self.callback(audio_data, self.sample_rate)
+                # Call callback in a thread-safe way
+                # Don't call the callback directly from audio thread - can cause Qt issues
+                # Instead, we'll store the data and let a timer process it
+                self.latest_audio_data = audio_data
+                self.latest_sample_rate = self.sample_rate
                 
             except Exception as e:
                 print(f"Monitor callback error: {e}")
@@ -257,11 +275,18 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        print("MainWindow __init__ started")
         self.setWindowTitle("Push to Text")
         self.setMinimumSize(800, 700)
 
-        # Initialize PyAudio
-        self.p = pyaudio.PyAudio()
+        # Initialize PyAudio with error handling
+        print("Initializing PyAudio...")
+        try:
+            self.p = pyaudio.PyAudio()
+            print("PyAudio initialized successfully")
+        except Exception as e:
+            print(f"PyAudio initialization failed: {e}")
+            raise
         
         # Recording state
         self.is_recording = False
@@ -277,6 +302,11 @@ class MainWindow(QMainWindow):
         self.thread_pool = QThreadPool()
         self.thread_pool.setMaxThreadCount(2)  # Allow multiple concurrent operations
         
+        # Timer for processing audio data from monitoring thread
+        self.spectrum_timer = QTimer()
+        self.spectrum_timer.timeout.connect(self.process_audio_data)
+        self.spectrum_timer.start(50)  # Process every 50ms
+        
         # Create central widget and main layout
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -284,7 +314,7 @@ class MainWindow(QMainWindow):
         
         # Device selection section
         device_layout = QHBoxLayout()
-        device_label = QLabel("WASAPI Input Device:")
+        device_label = QLabel("Audio Input Device:")
         self.device_combo = QComboBox()
         self.device_combo.setMinimumWidth(300)
         self.device_combo.currentTextChanged.connect(self.on_device_changed)
@@ -334,27 +364,41 @@ class MainWindow(QMainWindow):
         self.log_text.setReadOnly(True)
         main_layout.addWidget(self.log_text)
         
-        # Populate device dropdown
-        self.populate_device_combo()
+        # Populate device dropdown with error handling
+        print("Populating device combo...")
+        try:
+            self.populate_device_combo()
+            print("Device combo populated successfully")
+        except Exception as e:
+            print(f"Device combo population failed: {e}")
+            raise
         
-        # Start audio monitoring for visualization
-        self.start_audio_monitoring()
+        # Start audio monitoring for visualization with error handling
+        print("Starting audio monitoring...")
+        try:
+            # Use a timer to delay audio monitoring to avoid blocking initialization
+            QTimer.singleShot(1000, self.delayed_audio_monitoring)
+            print("Audio monitoring will start in 1 second...")
+        except Exception as e:
+            print(f"Audio monitoring setup failed: {e}")
+            # Don't raise here, monitoring can fail but app should still work
         
         # Log initialization
         self.log_message("Application initialized")
         self.log_message("Hold down 'Push to Text' button to record audio")
+        print("MainWindow __init__ completed")
 
     def populate_device_combo(self):
-        """Populate the device combo box with WASAPI input devices"""
+        """Populate the device combo box with input devices"""
         try:
-            devices_info = get_wasapi_devices_info(self.p)
+            devices_info = get_platform_devices_info(self.p)
             input_devices = devices_info.get("input", [])
             
             self.device_combo.clear()
             
             if not input_devices:
-                self.device_combo.addItem("No WASAPI input devices found")
-                self.log_message("No WASAPI input devices found")
+                self.device_combo.addItem("No input devices found")
+                self.log_message("No input devices found")
                 return
             
             # Add devices to combo box
@@ -364,7 +408,7 @@ class MainWindow(QMainWindow):
                 self.device_combo.addItem(device_name, device_index)
             
             # Try to select default input device
-            default_device = get_wasapi_default_input_device(self.p)
+            default_device = get_default_input_device_cross_platform(self.p)
             if default_device:
                 default_name = default_device.get("name", "")
                 for i in range(self.device_combo.count()):
@@ -372,26 +416,41 @@ class MainWindow(QMainWindow):
                         self.device_combo.setCurrentIndex(i)
                         break
             
-            self.log_message(f"Found {len(input_devices)} WASAPI input devices")
+            self.log_message(f"Found {len(input_devices)} input devices")
             
         except Exception as e:
             self.device_combo.addItem("Error loading devices")
-            self.log_message(f"Error loading WASAPI devices: {str(e)}")
+            self.log_message(f"Error loading audio devices: {str(e)}")
     
     def on_device_changed(self):
         """Handle device selection change"""
         self.restart_audio_monitoring()
     
+    def delayed_audio_monitoring(self):
+        """Start audio monitoring after a delay to avoid blocking initialization"""
+        print("Attempting delayed audio monitoring...")
+        self.start_audio_monitoring()
+    
     def start_audio_monitoring(self):
         """Start audio monitoring for real-time visualization"""
+        # Stop any existing monitor first
+        if self.monitor:
+            print("Stopping existing audio monitor...")
+            self.monitor.stop_monitoring()
+            self.monitor = None
+        
         device_id = self.get_selected_device_id()
         if device_id is None:
+            print("No device selected for monitoring")
             return
         
+        print(f"Starting monitoring with device ID: {device_id}")
         self.monitor = AudioMonitor(device_id, self.p, self.update_spectrum)
         if self.monitor.start_monitoring():
+            print("Audio monitoring started successfully")
             self.log_message("Audio monitoring started")
         else:
+            print("Failed to start audio monitoring")
             self.log_message("Failed to start audio monitoring")
     
     def restart_audio_monitoring(self):
@@ -399,6 +458,19 @@ class MainWindow(QMainWindow):
         if self.monitor:
             self.monitor.stop_monitoring()
         self.start_audio_monitoring()
+    
+    def process_audio_data(self):
+        """Process audio data from monitoring thread - called by timer on main thread"""
+        if self.monitor and hasattr(self.monitor, 'latest_audio_data') and self.monitor.latest_audio_data is not None:
+            # Get the latest data from the monitor
+            audio_data = self.monitor.latest_audio_data
+            sample_rate = self.monitor.latest_sample_rate
+            
+            # Clear the data to avoid processing the same data multiple times
+            self.monitor.latest_audio_data = None
+            
+            # Update spectrum on main thread
+            self.update_spectrum_safe(audio_data, sample_rate)
     
     def update_spectrum(self, audio_data, sample_rate):
         """Update spectrum - called from audio thread, emit signal for thread safety"""
@@ -621,8 +693,54 @@ class MainWindow(QMainWindow):
             traceback.print_exc()
     
 if __name__ == "__main__":
-    app = QApplication([])
-    window = MainWindow()
-    window.show()
-    app.exec()
+    print("Starting application...")
+    
+    try:
+        app = QApplication([])
+        print("QApplication created successfully")
+        
+        # macOS-specific application setup
+        if platform.system() == "Darwin":
+            print("Applying macOS-specific application setup...")
+            app.setApplicationName("Push to Text")
+            app.setApplicationDisplayName("Push to Text")
+            app.setQuitOnLastWindowClosed(True)
+        
+        print("Creating MainWindow...")
+        window = MainWindow()
+        print("MainWindow created successfully")
+        print(f"Window geometry: {window.geometry()}")
+        print(f"Window is visible: {window.isVisible()}")
+        print(f"Window is hidden: {window.isHidden()}")
+        
+        # macOS-specific window visibility fixes
+        if platform.system() == "Darwin":
+            print("Applying macOS-specific window visibility fixes...")
+            # Set window flags to ensure it appears
+            window.setWindowFlags(window.windowFlags() | Qt.WindowStaysOnTopHint)
+            window.show()
+            print(f"After first show - visible: {window.isVisible()}, hidden: {window.isHidden()}")
+            window.setWindowFlags(window.windowFlags() & ~Qt.WindowStaysOnTopHint)
+            window.show()
+            print(f"After second show - visible: {window.isVisible()}, hidden: {window.isHidden()}")
+            window.raise_()
+            window.activateWindow()
+            app.processEvents()
+            print("Window should now be visible")
+            
+            # Force application to front
+            print("Forcing application to front...")
+            import subprocess
+            subprocess.run(['osascript', '-e', 'tell application "System Events" to set frontmost of first process whose unix id is {} to true'.format(os.getpid())], check=False)
+        else:
+            window.show()
+        
+        print("Starting application event loop...")
+        app.exec()
+        print("Application finished")
+        
+    except Exception as e:
+        print(f"ERROR: {e}")
+        import traceback
+        traceback.print_exc()
 
