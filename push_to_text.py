@@ -77,10 +77,45 @@ class AudioRecorder:
         """Record a chunk of audio data"""
         if self.stream and self.recording:
             try:
-                data = self.stream.read(self.chunk, exception_on_overflow=False)
-                self.frames.append(data)
-                self.latest_chunk = data
-                return True
+                # Drain as much as is available to avoid overflow/drops
+                total_read = 0
+                last_chunk = None
+                bytes_per_frame = self.channels * self.p.get_sample_size(pyaudio.paInt16)
+                vis_bytes = self.chunk * bytes_per_frame
+                # Read at least once per call
+                while True:
+                    try:
+                        avail = self.stream.get_read_available()
+                    except Exception:
+                        avail = self.chunk
+
+                    # Determine how many frames to read this iteration
+                    to_read = 0
+                    if avail >= self.chunk:
+                        # Read in multiples of chunk to keep timing smooth
+                        to_read = (avail // self.chunk) * self.chunk
+                    elif total_read == 0:
+                        # Ensure we read at least one chunk per tick
+                        to_read = self.chunk
+                    else:
+                        break
+
+                    data = self.stream.read(to_read, exception_on_overflow=False)
+                    self.frames.append(data)
+                    total_read += to_read
+                    # Store the last chunk-sized slice for visualization
+                    if len(data) >= vis_bytes:
+                        last_chunk = data[-vis_bytes:]
+                    else:
+                        last_chunk = data
+
+                    # Avoid spending too long in one GUI tick
+                    if total_read >= self.sample_rate // 5:  # cap ~200ms worth
+                        break
+
+                if last_chunk is not None:
+                    self.latest_chunk = last_chunk
+                return total_read > 0
             except Exception as e:
                 return False
         return False
@@ -587,7 +622,15 @@ class MainWindow(QMainWindow):
             self.push_to_text_button.setStyleSheet("background-color: #ff4444; color: white;")
             self.push_to_text_button.repaint()
             QApplication.processEvents()
-            self.recording_timer.start(50)
+            # Read audio at the correct pace: timer interval must match buffer duration
+            try:
+                interval_ms = max(1, int(round(1000 * self.recorder.chunk / float(self.recorder.sample_rate))))
+            except Exception:
+                interval_ms = 50  # sensible fallback
+            self.recording_timer.start(interval_ms)
+            self.log_message(
+                f"Recording timer set to {interval_ms} ms (chunk={self.recorder.chunk}, rate={self.recorder.sample_rate}, channels={self.recorder.channels})"
+            )
             device_name = self.device_combo.currentText()
             self.log_message(f"Recording started with device: {device_name}")
         else:
