@@ -56,10 +56,11 @@ python push_to_text.py
    - Push-to-talk recording interface
    - Transcription output display
 
-4. **TranscriptionWorker** (`push_to_text.py:189`): Asynchronous OpenAI Whisper API integration
-   - Uses QRunnable for non-blocking transcription
-   - ThreadPoolExecutor for API call handling
+4. **AudioProcessingWorker** (`push_to_text.py:265`): Unified worker for audio file operations
+   - Handles saving, transcription, or combined save-and-transcribe operations
+   - Uses QRunnable for non-blocking processing
    - Automatic cleanup of temporary audio files
+   - Supports multiple processing modes in single worker class
 
 ### Audio Utilities (`util_audio.py`)
 Cross-platform audio device management functions:
@@ -69,11 +70,18 @@ Cross-platform audio device management functions:
 - Device capability detection and sample rate testing
 - Automatic fallback to system defaults when platform APIs unavailable
 
+### Audio Processing Utilities (`util_audio_processing.py`)
+Reusable audio signal processing functions:
+- **Data Conversion**: `bytes_to_audio_data()` - converts raw audio bytes to numpy arrays with channel handling
+- **Spectrum Analysis**: `compute_audio_spectrum()` - FFT-based frequency analysis with windowing and dB conversion
+- **Pipeline Function**: `process_audio_chunk_for_spectrum()` - complete bytes-to-spectrum processing
+
 ### Threading Architecture
 - Main GUI thread handles UI updates
-- Separate QRunnable workers for file I/O and API calls
+- **AudioProcessingWorker**: Unified QRunnable for all audio processing tasks (save/transcribe/both)
+- **Subprocess isolation**: OpenAI API calls run in separate processes for UI responsiveness
 - Thread-safe spectrum updates using Qt signals
-- QThreadPool manages concurrent operations
+- QThreadPool manages concurrent operations with automatic worker cleanup
 
 ## Key Technical Details
 

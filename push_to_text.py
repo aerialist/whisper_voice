@@ -29,37 +29,58 @@ from PySide6.QtWidgets import (
     QScrollArea, QCheckBox, QFrame
 )
 
-VERSION = "20250810"
+VERSION = "20250811"
 
 from util_audio import (
     get_platform_devices_info,
     get_device_info_by_id,
     get_default_input_device_cross_platform,
 )
+from util_audio_processing import (
+    bytes_to_audio_data,
+    compute_audio_spectrum,
+)
 
 load_dotenv()
 
-class AudioRecorder:
+class AudioDevice:
     def __init__(self, device_id, p, device_name=None):
         self.device_id = device_id
         self.p = p
         self.device_name = device_name or f"device_{device_id}"
         self.stream = None
-        self.recording = False
+        self.mode = None  # 'recording' or 'monitoring'
+        
+        # Recording state
         self.frames = []
         self.latest_chunk = None
+        
+        # Monitoring state
+        self.callback = None
+        self.latest_audio_data = None
+        self.latest_sample_rate = None
+        
+        # Shared audio parameters
+        self.sample_rate = None
+        self.channels = None
+        self.chunk = 1024
+        
+    def _initialize_audio_params(self):
+        """Initialize audio parameters from device info"""
+        device_info = get_device_info_by_id(self.device_id, self.p)
+        if not device_info:
+            return False, f"Device not found for ID: {self.device_id}"
+        
+        self.sample_rate = int(device_info.get('defaultSampleRate', 44100))
+        self.channels = min(int(device_info.get('maxInputChannels', 2)), 2)
+        return True, None
         
     def start_recording(self):
         """Start recording audio"""
         try:
-            device_info = get_device_info_by_id(self.device_id, self.p)
-            if not device_info:
-                return False, f"Device not found for ID: {self.device_id}"
-            
-            # Audio parameters
-            self.sample_rate = int(device_info.get('defaultSampleRate', 44100))
-            self.channels = min(int(device_info.get('maxInputChannels', 2)), 2)
-            self.chunk = 1024
+            success, error = self._initialize_audio_params()
+            if not success:
+                return False, error
             
             self.stream = self.p.open(
                 format=pyaudio.paInt16,
@@ -70,15 +91,46 @@ class AudioRecorder:
                 frames_per_buffer=self.chunk
             )
             
-            self.recording = True
+            self.mode = 'recording'
             self.frames = []
             return True
         except Exception as e:
             return False, str(e)
     
+    def start_monitoring(self, callback):
+        """Start monitoring audio for real-time visualization"""
+        try:
+            success, error = self._initialize_audio_params()
+            if not success:
+                print(f"Device {self.device_id} not found for monitoring")
+                return False
+            
+            self.callback = callback
+            
+            print(f"Opening audio stream for monitoring - device: {self.device_id}, rate: {self.sample_rate}, channels: {self.channels}")
+            
+            self.stream = self.p.open(
+                format=pyaudio.paInt16,
+                channels=self.channels,
+                rate=self.sample_rate,
+                input=True,
+                input_device_index=self.device_id,
+                frames_per_buffer=self.chunk,
+                stream_callback=self._audio_callback
+            )
+            
+            print("Audio stream opened successfully")
+            self.mode = 'monitoring'
+            self.stream.start_stream()
+            print("Audio monitoring started")
+            return True
+        except Exception as e:
+            print(f"Audio monitoring failed: {e}")
+            return False
+    
     def record_chunk(self):
-        """Record a chunk of audio data"""
-        if self.stream and self.recording:
+        """Record a chunk of audio data (only in recording mode)"""
+        if self.stream and self.mode == 'recording':
             try:
                 # Drain as much as is available to avoid overflow/drops
                 total_read = 0
@@ -123,36 +175,45 @@ class AudioRecorder:
                 return False
         return False
     
+    def _audio_callback(self, in_data, frame_count, time_info, status):
+        """Audio callback for real-time processing (monitoring mode)"""
+        if self.callback and self.mode == 'monitoring':
+            try:
+                # Convert bytes to numpy array using utility function
+                audio_data = bytes_to_audio_data(in_data, self.channels)
+                
+                if audio_data is not None:
+                    # Store the data to be processed by timer on main thread
+                    self.latest_audio_data = audio_data
+                    self.latest_sample_rate = self.sample_rate
+                
+            except Exception as e:
+                print(f"Monitor callback error: {e}")
+        
+        return (in_data, pyaudio.paContinue)
+    
     def get_latest_audio_data(self):
         """Get latest audio chunk as numpy array for analysis"""
-        if self.latest_chunk is None:
-            return None
+        # For recording mode, use latest_chunk
+        if self.mode == 'recording' and self.latest_chunk is not None:
+            return bytes_to_audio_data(self.latest_chunk, self.channels)
         
-        try:
-            # Convert bytes to numpy array
-            audio_data = np.frombuffer(self.latest_chunk, dtype=np.int16)
-            
-            # If stereo, take only the first channel
-            if self.channels == 2:
-                audio_data = audio_data[0::2]
-            
-            # Debug: Check data validity
-            if len(audio_data) == 0:
-                return None
-                
-            return audio_data
-        except Exception:
-            return None
+        # For monitoring mode, return None as data is handled by callback
+        return None
     
-    def stop_recording(self):
-        """Stop recording and return audio data"""
-        self.recording = False
+    def stop(self):
+        """Stop recording or monitoring"""
         if self.stream:
+            if self.mode == 'monitoring':
+                self.mode = None
+            elif self.mode == 'recording':
+                self.mode = None
+                
             self.stream.stop_stream()
             self.stream.close()
             self.stream = None
         
-        return self.frames
+        return self.frames if hasattr(self, 'frames') else []
     
     def save_to_wav(self, filename):
         """Save recorded audio to WAV file"""
@@ -201,112 +262,86 @@ class AudioRecorder:
         except Exception as e:
             return False, str(e)
 
-class AudioMonitor:
-    def __init__(self, device_id, p, callback):
-        self.device_id = device_id
-        self.p = p
-        self.callback = callback
-        self.stream = None
-        self.monitoring = False
-        self.latest_audio_data = None
-        self.latest_sample_rate = None
-        
-    def start_monitoring(self):
-        """Start monitoring audio for real-time visualization"""
-        try:
-            device_info = get_device_info_by_id(self.device_id, self.p)
-            if not device_info:
-                print(f"Device {self.device_id} not found for monitoring")
-                return False
-            
-            self.sample_rate = int(device_info.get('defaultSampleRate', 44100))
-            self.channels = min(int(device_info.get('maxInputChannels', 2)), 2)
-            self.chunk = 1024
-            
-            print(f"Opening audio stream for monitoring - device: {self.device_id}, rate: {self.sample_rate}, channels: {self.channels}")
-            
-            # Add timeout and error handling for macOS microphone permission issues
-            self.stream = self.p.open(
-                format=pyaudio.paInt16,
-                channels=self.channels,
-                rate=self.sample_rate,
-                input=True,
-                input_device_index=self.device_id,
-                frames_per_buffer=self.chunk,
-                stream_callback=self._audio_callback
-            )
-            
-            print("Audio stream opened successfully")
-            self.monitoring = True
-            self.stream.start_stream()
-            print("Audio monitoring started")
-            return True
-        except Exception as e:
-            print(f"Audio monitoring failed: {e}")
-            return False
-    
-    def _audio_callback(self, in_data, frame_count, time_info, status):
-        """Audio callback for real-time processing"""
-        if self.callback and self.monitoring:
-            try:
-                # Convert bytes to numpy array
-                audio_data = np.frombuffer(in_data, dtype=np.int16)
-                
-                # If stereo, take only the first channel
-                if self.channels == 2:
-                    audio_data = audio_data[0::2]
-                
-                # Store the data to be processed by timer on main thread
-                self.latest_audio_data = audio_data
-                self.latest_sample_rate = self.sample_rate
-                
-            except Exception as e:
-                print(f"Monitor callback error: {e}")
-        
-        return (in_data, pyaudio.paContinue)
-    
-    def stop_monitoring(self):
-        """Stop monitoring"""
-        self.monitoring = False
-        if self.stream:
-            self.stream.stop_stream()
-            self.stream.close()
-            self.stream = None
-
-class TranscriptionWorker(QRunnable):
+class AudioProcessingWorker(QRunnable):
     class Signals(QObject):
         finished = Signal(str, str)  # transcription_text, file_path
         error = Signal(str, str)     # error_message, file_path
         progress = Signal(str)       # progress message
+        saved = Signal(str)          # temp_file_path (for save-only mode)
 
-    def __init__(self, audio_file_path):
+    def __init__(self, audio_device=None, audio_file_path=None, temp_file_name=None, mode='transcribe'):
         super().__init__()
+        self.audio_device = audio_device
         self.audio_file_path = audio_file_path
+        self.temp_file_name = temp_file_name
+        self.mode = mode  # 'save', 'transcribe', or 'save_and_transcribe'
+        
         self.signals = self.Signals()
         self.finished = self.signals.finished
         self.error = self.signals.error
         self.progress = self.signals.progress
+        self.saved = self.signals.saved
+        
         # Configure sensible per-request timeouts to avoid long UI waits
         self._timeout_seconds = 45.0
         self._max_retries = 0
 
     def run(self):
-        """Transcribe audio using OpenAI Whisper API (runs in thread pool)"""
+        """Process audio based on the specified mode"""
         try:
-            self.progress.emit("worker: start")
-            transcript_text = self._transcribe_sync()
-            self.finished.emit(transcript_text, self.audio_file_path)
+            if self.mode == 'save':
+                self._save_audio()
+            elif self.mode == 'transcribe':
+                self._transcribe_audio()
+            elif self.mode == 'save_and_transcribe':
+                self._save_and_transcribe()
         except Exception as e:
-            self.error.emit(str(e), self.audio_file_path)
-        finally:
-            # Clean up the temporary file
-            try:
-                os.unlink(self.audio_file_path)
-            except Exception:
-                pass
+            file_path = self.audio_file_path or self.temp_file_name
+            self.error.emit(str(e), file_path or "unknown")
+
+    def _save_audio(self):
+        """Save audio to file"""
+        if self.audio_device.save_to_wav(self.temp_file_name):
+            self.saved.emit(self.temp_file_name)
+        else:
+            self.error.emit("Failed to save audio file", self.temp_file_name)
+
+    def _transcribe_audio(self):
+        """Transcribe existing audio file"""
+        self.progress.emit("worker: start")
+        transcript_text = self._transcribe_sync()
+        self.finished.emit(transcript_text, self.audio_file_path)
+        
+        # Clean up the temporary file
+        try:
+            os.unlink(self.audio_file_path)
+        except Exception:
+            pass
+
+    def _save_and_transcribe(self):
+        """Save audio then transcribe it"""
+        # First save the audio
+        if not self.audio_device.save_to_wav(self.temp_file_name):
+            self.error.emit("Failed to save audio file", self.temp_file_name)
+            return
+        
+        # Then transcribe it
+        self.progress.emit("worker: start transcription")
+        transcript_text = self._transcribe_sync_from_file(self.temp_file_name)
+        self.finished.emit(transcript_text, self.temp_file_name)
+        
+        # Clean up the temporary file
+        try:
+            os.unlink(self.temp_file_name)
+        except Exception:
+            pass
 
     def _transcribe_sync(self):
-        """Synchronous transcription method"""
+        """Synchronous transcription method for existing file"""
+        return self._transcribe_sync_from_file(self.audio_file_path)
+
+    def _transcribe_sync_from_file(self, file_path):
+        """Synchronous transcription method for specified file"""
         # Validate API key early for fast failure (avoids perceived freeze)
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key or not api_key.strip():
@@ -315,7 +350,7 @@ class TranscriptionWorker(QRunnable):
         # Create client with strict timeouts and no automatic retries to keep UI responsive
         client = openai.OpenAI(timeout=self._timeout_seconds, max_retries=self._max_retries)
 
-        with open(self.audio_file_path, "rb") as audio_file:
+        with open(file_path, "rb") as audio_file:
             self.progress.emit("worker: request -> openai")
             transcript = client.audio.transcriptions.create(
                 model="whisper-1",
@@ -324,28 +359,6 @@ class TranscriptionWorker(QRunnable):
 
         self.progress.emit("worker: done")
         return transcript.text
-
-class SaveAndTranscribeWorker(QRunnable):
-    class Signals(QObject):
-        finished = Signal(str)  # audio_file_path
-        error = Signal(str, str)  # error_message, audio_file_path
-
-    def __init__(self, recorder, temp_file_name):
-        super().__init__()
-        self.recorder = recorder
-        self.temp_file_name = temp_file_name
-        self.signals = self.Signals()
-        self.finished = self.signals.finished
-        self.error = self.signals.error
-
-    def run(self):
-        try:
-            if self.recorder.save_to_wav(self.temp_file_name):
-                self.finished.emit(self.temp_file_name)
-            else:
-                self.error.emit("Failed to save audio file", self.temp_file_name)
-        except Exception as e:
-            self.error.emit(str(e), self.temp_file_name)
 
 class MainWindow(QMainWindow):
     # Add signals for recording control
@@ -369,8 +382,7 @@ class MainWindow(QMainWindow):
 
         # Recording/monitoring state
         self.is_recording = False
-        self.recorders = {}
-        self.monitors = {}
+        self.audio_devices = {}
         self.device_colors = {}
         self.spectrum_curves = {}
         self.device_checkboxes = []
@@ -542,74 +554,42 @@ class MainWindow(QMainWindow):
     
     def start_audio_monitoring(self):
         """Start audio monitoring for real-time visualization"""
-        # Stop and clear existing monitors and curves
-        if self.monitors:
-            print("Stopping existing audio monitors...")
-            for m in self.monitors.values():
-                try:
-                    m.stop_monitoring()
-                except Exception:
-                    pass
-            self.monitors.clear()
-
-        # Determine selected device IDs
+        # Stop existing monitoring devices
+        self._stop_devices_by_mode('monitoring')
+        
+        # Get selected devices
         selected = self.get_selected_device_ids()
-        selected_ids = set([d for d, _ in selected])
-
-        # Remove curves (and legend entries) for devices no longer selected
-        for device_id in list(self.spectrum_curves.keys()):
-            if device_id not in selected_ids:
-                curve = self.spectrum_curves.pop(device_id, None)
-                if curve is not None:
-                    try:
-                        self.spectrum_widget.removeItem(curve)
-                    except Exception:
-                        pass
-                    if getattr(self, 'legend', None):
-                        try:
-                            self.legend.removeItem(curve)
-                        except Exception:
-                            pass
-        # Create monitoring for each selected device
         if not selected:
             print("No devices selected for monitoring")
             return
 
-        for i, (device_id, device_name) in enumerate(selected):
+        # Manage spectrum curves for selected devices
+        self._manage_spectrum_curves_for_devices(selected)
+
+        # Start monitoring for each selected device
+        for device_id, device_name in selected:
             print(f"Starting monitoring with device ID: {device_id}")
-            # Assign color if not exists
-            if device_id not in self.device_colors:
-                self.device_colors[device_id] = pg.intColor(len(self.device_colors))
-            # Ensure curve exists
-            if device_id not in self.spectrum_curves:
-                self.spectrum_curves[device_id] = self.spectrum_widget.plot(pen=self.device_colors[device_id], width=2, name=device_name)
-            monitor = AudioMonitor(device_id, self.p, self.update_spectrum)
-            if monitor.start_monitoring():
-                self.monitors[device_id] = monitor
+            
+            device = AudioDevice(device_id, self.p, device_name)
+            if device.start_monitoring(self.update_spectrum):
+                self.audio_devices[device_id] = device
                 print(f"Audio monitoring started for {device_name}")
             else:
                 self.log_message(f"Failed to start audio monitoring for {device_name}")
     
     def restart_audio_monitoring(self):
         """Restart audio monitoring with new device"""
-        # Stop any existing monitors
-        if self.monitors:
-            for m in self.monitors.values():
-                try:
-                    m.stop_monitoring()
-                except Exception:
-                    pass
-            self.monitors.clear()
+        # Simply restart monitoring - start_audio_monitoring handles cleanup
         self.start_audio_monitoring()
     
     def process_audio_data(self):
         """Process audio data from monitoring thread - called by timer on main thread"""
-        # Iterate over monitors and process available data
-        for device_id, mon in list(self.monitors.items()):
-            if hasattr(mon, 'latest_audio_data') and mon.latest_audio_data is not None:
-                audio_data = mon.latest_audio_data
-                sample_rate = mon.latest_sample_rate
-                mon.latest_audio_data = None
+        # Iterate over audio devices and process available data
+        for device_id, device in list(self.audio_devices.items()):
+            if device.mode == 'monitoring' and device.latest_audio_data is not None:
+                audio_data = device.latest_audio_data
+                sample_rate = device.latest_sample_rate
+                device.latest_audio_data = None
                 self.update_spectrum_safe(device_id, audio_data, sample_rate)
     
     def update_spectrum(self, device_id, audio_data, sample_rate):
@@ -620,33 +600,13 @@ class MainWindow(QMainWindow):
     def update_spectrum_safe(self, device_id, audio_data, sample_rate):
         """Update the frequency spectrum plot - runs on main GUI thread"""
         try:
-            # Apply window function to reduce spectral leakage
-            windowed_data = audio_data.astype(np.float64) * np.hanning(len(audio_data))
+            # Compute spectrum using utility function
+            freqs_filtered, magnitude_filtered = compute_audio_spectrum(audio_data, sample_rate)
             
-            # Compute FFT
-            fft = np.fft.rfft(windowed_data)
-            magnitude = np.abs(fft)
-            
-            # Normalize magnitude for 16-bit audio
-            max_possible = 32767 * len(audio_data) / 2  # FFT scaling factor
-            magnitude_normalized = magnitude / max_possible
-            
-            # Convert to dB (0 dB = maximum possible level)
-            magnitude_db = 20 * np.log10(magnitude_normalized + 1e-10)
-            
-            # Frequency array
-            freqs = np.fft.rfftfreq(len(audio_data), 1/sample_rate)
-            
-            # Filter to 20..20000 Hz
-            valid_indices = (freqs >= 20) & (freqs <= 20000)
-            freqs_filtered = freqs[valid_indices]
-            magnitude_filtered = magnitude_db[valid_indices]
-            
-            if len(freqs_filtered) > 0:
-                if device_id not in self.spectrum_curves:
-                    color = self.device_colors.get(device_id, pg.intColor(len(self.device_colors)))
-                    device_name = self.get_device_name_by_id(device_id) or f"Device {device_id}"
-                    self.spectrum_curves[device_id] = self.spectrum_widget.plot(pen=color, width=2, name=device_name)
+            if freqs_filtered is not None and magnitude_filtered is not None:
+                # Ensure curve exists for this device
+                self._ensure_spectrum_curve(device_id)
+                # Update the curve with new data
                 self.spectrum_curves[device_id].setData(freqs_filtered, magnitude_filtered)
         
         except Exception as e:
@@ -656,36 +616,32 @@ class MainWindow(QMainWindow):
         """Record chunks from all active recorders"""
         if not self.is_recording:
             return
+            
         selected_ids = set([d for d, _ in self.get_selected_device_ids()])
-        for device_id, rec in list(self.recorders.items()):
+        for device_id, device in list(self.audio_devices.items()):
+            if device.mode != 'recording':
+                continue
+                
             # If device is no longer selected, remove its curve and skip plotting
             if device_id not in selected_ids:
-                if device_id in self.spectrum_curves:
-                    curve = self.spectrum_curves.pop(device_id)
-                    try:
-                        self.spectrum_widget.removeItem(curve)
-                    except Exception:
-                        pass
-                    if getattr(self, 'legend', None):
-                        try:
-                            self.legend.removeItem(curve)
-                        except Exception:
-                            pass
+                self._remove_device_curve(device_id)
                 # Still drain audio to keep buffers healthy, but don't plot
                 try:
-                    rec.record_chunk()
+                    device.record_chunk()
                 except Exception:
                     pass
                 continue
-            success = rec.record_chunk()
+                
+            success = device.record_chunk()
             if success:
-                audio_data = rec.get_latest_audio_data()
+                audio_data = device.get_latest_audio_data()
                 if audio_data is not None:
-                    self.update_spectrum_safe(device_id, audio_data, rec.sample_rate)
+                    self.update_spectrum_safe(device_id, audio_data, device.sample_rate)
     
     def toggle_recording(self):
         """Toggle recording on button click"""
-        if self.push_to_text_button.isChecked():
+        # Use actual recording state instead of button state to avoid sync issues
+        if not self.is_recording:
             self.start_recording()
         else:
             self.stop_recording()
@@ -698,52 +654,46 @@ class MainWindow(QMainWindow):
         selected = self.get_selected_device_ids()
         if not selected:
             self.log_message("No input devices selected")
-            self.push_to_text_button.setChecked(False)
+            # Reset button to unchecked state since recording failed to start
+            self._update_button_state(checked=False)
             return
 
         # Reset session results for a new recording session
         self.session_results = []
 
         # Stop monitoring to avoid device conflicts
-        if self.monitors:
-            for m in self.monitors.values():
-                try:
-                    m.stop_monitoring()
-                except Exception:
-                    pass
-            self.monitors.clear()
-            self.log_message("Stopped audio monitoring during recording")
+        self._stop_devices_by_mode('monitoring')
+        self.log_message("Stopped audio monitoring during recording")
 
         # Create and start recorders for each selected device
-        self.recorders.clear()
         start_failures = []
         for device_id, device_name in selected:
-            rec = AudioRecorder(device_id, self.p, device_name)
-            result = rec.start_recording()
+            device = AudioDevice(device_id, self.p, device_name)
+            result = device.start_recording()
             if result is True:
-                self.recorders[device_id] = rec
-                # Assign colors/curves if not present
-                if device_id not in self.device_colors:
-                    self.device_colors[device_id] = pg.intColor(len(self.device_colors))
-                if device_id not in self.spectrum_curves:
-                    self.spectrum_curves[device_id] = self.spectrum_widget.plot(pen=self.device_colors[device_id], width=2, name=device_name)
+                self.audio_devices[device_id] = device
+                # Ensure visualization is set up  
+                self._ensure_spectrum_curve(device_id)
             else:
                 err = result[1] if isinstance(result, tuple) else "Unknown error"
                 start_failures.append((device_name, err))
 
-        if self.recorders:
+        recording_devices = [d for d in self.audio_devices.values() if d.mode == 'recording']
+        if recording_devices:
             self.is_recording = True
-            self.push_to_text_button.setText("Recording... (Click again to stop)")
-            self.push_to_text_button.setStyleSheet("background-color: #ff4444; color: white;")
-            self.push_to_text_button.repaint()
-            QApplication.processEvents()
+            self._update_button_state(
+                text="Recording... (Click again to stop)",
+                style="background-color: #ff4444; color: white;",
+                checked=True,
+                force_refresh=True
+            )
             # Use a conservative timer interval; recorders drain available data internally
             interval_ms = 30
             self.recording_timer.start(interval_ms)
             self.log_message(
-                f"Recording timer set to {interval_ms} ms across {len(self.recorders)} devices"
+                f"Recording timer set to {interval_ms} ms across {len(recording_devices)} devices"
             )
-            names = ", ".join([rec.device_name for rec in self.recorders.values()])
+            names = ", ".join([device.device_name for device in recording_devices])
             self.log_message(f"Recording started with devices: {names}")
             if start_failures:
                 for name, err in start_failures:
@@ -753,7 +703,8 @@ class MainWindow(QMainWindow):
                 for name, err in start_failures:
                     self.log_message(f"Failed to start device '{name}': {err}")
             self.log_message("Failed to start recording on any device")
-            self.push_to_text_button.setChecked(False)
+            # Reset button to unchecked state since recording failed to start
+            self._update_button_state(checked=False)
             self.start_audio_monitoring()
 
     def stop_recording(self):
@@ -765,24 +716,28 @@ class MainWindow(QMainWindow):
         self.is_recording = False
 
         # UI update first
-        self.push_to_text_button.setText("Processing...")
-        self.push_to_text_button.setStyleSheet("background-color: #ffaa00; color: white;")
-        self.push_to_text_button.setEnabled(False)
-        self.push_to_text_button.repaint()
-        QApplication.processEvents()
+        self._update_button_state(
+            text="Processing...",
+            style="background-color: #ffaa00; color: white;",
+            enabled=False,
+            checked=False,
+            force_refresh=True
+        )
 
         QTimer.singleShot(0, self._after_stop_recording)
 
     def _after_stop_recording(self):
         # Stop all recorders and gather frames
         any_frames = False
-        stopped_recorders = []
-        for device_id, rec in list(self.recorders.items()):
-            frames = rec.stop_recording()
-            stopped_recorders.append(rec)
-            if frames:
-                any_frames = True
-        self.recorders.clear()
+        stopped_devices = []
+        for device_id in list(self.audio_devices.keys()):
+            device = self.audio_devices[device_id]
+            if device.mode == 'recording':
+                frames = device.stop()
+                stopped_devices.append(device)
+                if frames:
+                    any_frames = True
+                del self.audio_devices[device_id]
         self.log_message("Recording stopped")
 
     # Don't restart audio monitoring during transcription; resume after finalize
@@ -792,26 +747,27 @@ class MainWindow(QMainWindow):
             self.reset_button()
             return
 
-        # Save and transcribe each recorder
+        # Save and transcribe each recorded device
         self.pending_transcriptions = 0
-        for rec in stopped_recorders:
-            if not rec.frames:
+        for device in stopped_devices:
+            if not device.frames:
                 continue
             # Save to recordings folder first
-            success, result = rec.save_to_recordings_folder()
+            success, result = device.save_to_recordings_folder()
             if success:
                 self.log_message(f"Audio saved to: {result}")
             else:
-                self.log_message(f"Failed to save recording for {rec.device_name}: {result}")
+                self.log_message(f"Failed to save recording for {device.device_name}: {result}")
             # Create temp file for transcription
             temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
             temp_file.close()
             # Map temp file to device, id, and final saved recording path
-            self.tempfile_to_device[temp_file.name] = (rec.device_name, rec.device_id, result if success else None)
-            # Save WAV in background
-            worker = SaveAndTranscribeWorker(rec, temp_file.name)
-            worker.finished.connect(self.transcribe_audio)
-            worker.error.connect(self._on_save_audio_error)
+            self.tempfile_to_device[temp_file.name] = (device.device_name, device.device_id, result if success else None)
+            # Save WAV and transcribe in single worker
+            worker = AudioProcessingWorker(audio_device=device, temp_file_name=temp_file.name, mode='save_and_transcribe')
+            worker.finished.connect(self.on_transcription_finished)
+            worker.error.connect(self.on_transcription_error)
+            worker.progress.connect(self._on_worker_progress)
             # Retain until completion
             self._active_workers.add(worker)
             worker.finished.connect(lambda *_, w=worker: self._active_workers.discard(w))
@@ -820,20 +776,20 @@ class MainWindow(QMainWindow):
             self.pending_transcriptions += 1
 
         if self.pending_transcriptions > 0:
-            self.processing_heartbeat.start()
+            self._ensure_heartbeat_active()
 
-    def _on_save_audio_error(self, msg, temp_file_name):
-        self.log_message(msg)
-        self.reset_button()
-        try:
-            os.unlink(temp_file_name)
-        except Exception:
-            pass
 
     def transcribe_audio(self, audio_file_path):
         """Transcribe audio file using OpenAI Whisper API"""
         self.log_message("Starting transcription with OpenAI Whisper...")
         # Prefer subprocess isolation to guarantee the UI process never blocks
+        self._start_transcription_subprocess(audio_file_path)
+        
+        # Ensure heartbeat is running
+        self._ensure_heartbeat_active()
+
+    def _start_transcription_subprocess(self, audio_file_path):
+        """Start transcription subprocess with fallback to thread worker"""
         try:
             proc = QProcess(self)
             proc.setProcessChannelMode(QProcess.MergedChannels)
@@ -845,21 +801,19 @@ class MainWindow(QMainWindow):
         except Exception as _proc_err:
             # Fallback to thread worker
             self.log_message(f"Subprocess start failed, falling back to thread: {_proc_err}")
-            worker = TranscriptionWorker(audio_file_path)
-            worker.finished.connect(self.on_transcription_finished)
-            worker.error.connect(self.on_transcription_error)
-            worker.progress.connect(self._on_worker_progress)
-            self._active_workers.add(worker)
-            worker.finished.connect(lambda *_, w=worker: self._active_workers.discard(w))
-            worker.error.connect(lambda *_, w=worker: self._active_workers.discard(w))
-            self.thread_pool.start(worker)
-            self.log_message("Transcription dispatched to background thread")
-        # Ensure heartbeat is running even if save stage didn't start it
-        try:
-            if not self.processing_heartbeat.isActive():
-                self.processing_heartbeat.start()
-        except Exception:
-            pass
+            self._start_transcription_thread(audio_file_path)
+
+    def _start_transcription_thread(self, audio_file_path):
+        """Start transcription in thread worker"""
+        worker = AudioProcessingWorker(audio_file_path=audio_file_path, mode='transcribe')
+        worker.finished.connect(self.on_transcription_finished)
+        worker.error.connect(self.on_transcription_error)
+        worker.progress.connect(self._on_worker_progress)
+        self._active_workers.add(worker)
+        worker.finished.connect(lambda *_, w=worker: self._active_workers.discard(w))
+        worker.error.connect(lambda *_, w=worker: self._active_workers.discard(w))
+        self.thread_pool.start(worker)
+        self.log_message("Transcription dispatched to background thread")
 
     def _on_proc_output(self, proc: QProcess, audio_file_path: str):
         try:
@@ -950,12 +904,35 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
     
+    def _update_button_state(self, text="Push to Text", style="", enabled=True, checked=False, force_refresh=False):
+        """Unified method to update Push to Text button state"""
+        self.push_to_text_button.setText(text)
+        self.push_to_text_button.setStyleSheet(style)
+        self.push_to_text_button.setEnabled(enabled)
+        self.push_to_text_button.setChecked(checked)
+        
+        if force_refresh:
+            self.push_to_text_button.repaint()
+            QApplication.processEvents()
+
+    def _ensure_heartbeat_active(self):
+        """Ensure processing heartbeat timer is running"""
+        try:
+            if not self.processing_heartbeat.isActive():
+                self.processing_heartbeat.start()
+        except Exception:
+            pass
+
+    def _stop_heartbeat(self):
+        """Stop processing heartbeat timer safely"""
+        try:
+            self.processing_heartbeat.stop()
+        except Exception:
+            pass
+
     def reset_button(self):
         """Reset the Push to Text button to its default state"""
-        self.push_to_text_button.setChecked(False)
-        self.push_to_text_button.setText("Push to Text")
-        self.push_to_text_button.setStyleSheet("")
-        self.push_to_text_button.setEnabled(True)
+        self._update_button_state()
 
     def _finalize_session_and_reset(self):
         """Save session JSON summary if available, then reset the UI button."""
@@ -974,10 +951,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.log_message(f"Failed to save transcription summary: {e}")
         finally:
-            try:
-                self.processing_heartbeat.stop()
-            except Exception:
-                pass
+            self._stop_heartbeat()
             self.reset_button()
             # Now that transcription work is done, resume audio monitoring
             self.start_audio_monitoring()
@@ -987,22 +961,20 @@ class MainWindow(QMainWindow):
         if self.pending_transcriptions > 0:
             self.log_message(f"Transcription pending: {self.pending_transcriptions}")
         else:
-            try:
-                self.processing_heartbeat.stop()
-            except Exception:
-                pass
+            self._stop_heartbeat()
 
     def closeEvent(self, event):
         """Clean up when closing the application"""
         if self.is_recording:
             self.stop_recording()
         
-        if self.monitors:
-            for m in self.monitors.values():
-                try:
-                    m.stop_monitoring()
-                except Exception:
-                    pass
+        # Stop all audio devices
+        for device in list(self.audio_devices.values()):
+            try:
+                device.stop()
+            except Exception:
+                pass
+        self.audio_devices.clear()
         
         if hasattr(self, 'p'):
             self.p.terminate()
@@ -1010,11 +982,7 @@ class MainWindow(QMainWindow):
 
     def get_selected_device_ids(self):
         """Get a list of (device_id, device_name) for selected devices"""
-        selected = []
-        for cb, device_id, device_name in self.device_checkboxes:
-            if cb.isChecked():
-                selected.append((device_id, device_name))
-        return selected
+        return [(device_id, device_name) for cb, device_id, device_name in self.device_checkboxes if cb.isChecked()]
     
     def log_message(self, message):
         """Add a message to the log text area"""
@@ -1024,10 +992,75 @@ class MainWindow(QMainWindow):
 
     def get_device_name_by_id(self, device_id):
         """Lookup a device name by its device_id from the checkbox list."""
-        for cb, did, name in self.device_checkboxes:
-            if did == device_id:
-                return name
-        return None
+        return next((name for cb, did, name in self.device_checkboxes if did == device_id), None)
+
+    def _stop_devices_by_mode(self, mode):
+        """Stop all devices operating in the specified mode."""
+        for device_id in list(self.audio_devices.keys()):
+            device = self.audio_devices[device_id]
+            if device.mode == mode:
+                try:
+                    device.stop()
+                except Exception:
+                    pass
+                del self.audio_devices[device_id]
+
+    def _cleanup_unselected_curves(self, selected_devices):
+        """Remove visualization curves for devices that are no longer selected."""
+        selected_ids = set([d for d, _ in selected_devices])
+        for device_id in list(self.spectrum_curves.keys()):
+            if device_id not in selected_ids:
+                self._remove_device_curve(device_id)
+
+    def _manage_spectrum_curves_for_devices(self, selected_devices):
+        """Comprehensive spectrum curve management for selected devices."""
+        # Clean up curves for unselected devices
+        self._cleanup_unselected_curves(selected_devices)
+        # Ensure curves exist for selected devices
+        for device_id, device_name in selected_devices:
+            self._ensure_device_visualization(device_id, device_name)
+
+    def _clear_all_spectrum_curves(self):
+        """Remove all spectrum curves and clear related data."""
+        for device_id in list(self.spectrum_curves.keys()):
+            self._remove_device_curve(device_id)
+        self.device_colors.clear()
+
+    def _remove_device_curve(self, device_id):
+        """Remove a specific device's visualization curve and legend entry."""
+        curve = self.spectrum_curves.pop(device_id, None)
+        if curve is not None:
+            try:
+                self.spectrum_widget.removeItem(curve)
+            except Exception:
+                pass
+            if getattr(self, 'legend', None):
+                try:
+                    self.legend.removeItem(curve)
+                except Exception:
+                    pass
+
+    def _ensure_device_color(self, device_id):
+        """Assign color to device if not already assigned."""
+        if device_id not in self.device_colors:
+            self.device_colors[device_id] = pg.intColor(len(self.device_colors))
+        return self.device_colors[device_id]
+
+    def _ensure_spectrum_curve(self, device_id):
+        """Ensure spectrum curve exists for device."""
+        if device_id not in self.spectrum_curves:
+            color = self._ensure_device_color(device_id)
+            device_name = self.get_device_name_by_id(device_id) or f"Device {device_id}"
+            self.spectrum_curves[device_id] = self.spectrum_widget.plot(
+                pen=color, 
+                width=2, 
+                name=device_name
+            )
+
+    def _ensure_device_visualization(self, device_id, device_name):
+        """Ensure device has assigned color and spectrum curve."""
+        self._ensure_device_color(device_id)
+        self._ensure_spectrum_curve(device_id)
 
     def test_plot(self):
         """Test if the plot widget is working"""
@@ -1038,7 +1071,7 @@ class MainWindow(QMainWindow):
             
             print(f"Testing plot with {len(test_freqs)} points")
             # Create a temporary curve for test
-            temp_curve = self.spectrum_widget.plot(pen='y', width=2)
+            temp_curve = self.spectrum_widget.plot(pen='y', width=2, name="Test Signal")
             temp_curve.setData(test_freqs, test_magnitudes)
             print("Test plot should now be visible")
         except Exception as e:
