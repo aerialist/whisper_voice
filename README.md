@@ -8,3 +8,9 @@ use pyaudio instead of pyaudiowpatch
 
 brew install portaudio
 pip install pyaudio
+
+## TODO
+
+[] Compare transcription models: whisper-1, gpt-4o-mini-transcribe, gpt-4o-transcribe
+[] Apply FIR filter realtime
+[x] Add air monitor checkbox

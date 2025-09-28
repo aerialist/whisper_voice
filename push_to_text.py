@@ -26,7 +26,7 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QMessageBox, QSizePolicy, QTextEdit,
-    QScrollArea, QCheckBox, QFrame
+    QScrollArea, QCheckBox, QFrame, QComboBox
 )
 
 VERSION = "20250811"
@@ -35,6 +35,7 @@ from util_audio import (
     get_platform_devices_info,
     get_device_info_by_id,
     get_default_input_device_cross_platform,
+    get_default_devices,
 )
 from util_audio_processing import (
     bytes_to_audio_data,
@@ -243,7 +244,7 @@ class AudioDevice:
                 os.makedirs(recordings_dir)
             
             # Generate filename with timestamp and device name
-            timestamp = datetime.now().strftime("%Y%m%d%H%M")
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
             # Sanitize device name for filename
             safe_device_name = "".join(c for c in self.device_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
             safe_device_name = safe_device_name.replace(" ", "_")
@@ -391,6 +392,14 @@ class MainWindow(QMainWindow):
         self.session_results = []
         self._active_workers = set()
         self._procs = {}
+        
+        # Air monitoring state
+        self.is_air_monitoring = False
+        self.output_device_id = None
+        self.output_stream = None
+        self.mixed_audio_buffer = None
+        self.mixing_sample_rate = 44100
+        self.mixing_channels = 2
 
         self.recording_timer = QTimer()
         self.recording_timer.timeout.connect(self.record_chunks)
@@ -417,8 +426,10 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
 
-        # Device selection section (checkboxes)
+        # Device selection section
         device_layout = QVBoxLayout()
+        
+        # Input devices section
         device_label = QLabel("Audio Input Devices:")
         device_layout.addWidget(device_label)
         self.device_scroll = QScrollArea()
@@ -430,6 +441,30 @@ class MainWindow(QMainWindow):
         self.device_list_layout.setSpacing(4)
         self.device_scroll.setWidget(container)
         device_layout.addWidget(self.device_scroll)
+        
+        # Output device and air monitor controls in horizontal layout
+        output_layout = QHBoxLayout()
+        
+        # Audio Output Device selection
+        output_label = QLabel("Audio Output Device:")
+        output_layout.addWidget(output_label)
+        
+        self.output_device_combo = QComboBox()
+        self.output_device_combo.setMinimumWidth(200)
+        output_layout.addWidget(self.output_device_combo)
+        
+        # Air monitor checkbox
+        self.air_monitor_checkbox = QCheckBox("Air Monitor")
+        self.air_monitor_checkbox.setChecked(False)
+        self.air_monitor_checkbox.stateChanged.connect(self.on_air_monitor_changed)
+        output_layout.addWidget(self.air_monitor_checkbox)
+        
+        # Test the connection
+        print(f"Air monitor checkbox created, signal connected: {self.air_monitor_checkbox.stateChanged}")
+        
+        output_layout.addStretch()  # Push controls to the left
+        device_layout.addLayout(output_layout)
+        
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
         line.setFrameShadow(QFrame.Sunken)
@@ -477,11 +512,12 @@ class MainWindow(QMainWindow):
         self.log_text.setReadOnly(True)
         main_layout.addWidget(self.log_text)
 
-        # Populate device checkboxes with error handling
-        print("Populating device list...")
+        # Populate device checkboxes and output devices with error handling
+        print("Populating device lists...")
         try:
             self.populate_device_checkboxes()
-            print("Device list populated successfully")
+            self.populate_output_devices()
+            print("Device lists populated successfully")
         except Exception as e:
             print(f"Device list population failed: {e}")
             raise
@@ -496,6 +532,7 @@ class MainWindow(QMainWindow):
 
         # Log initialization
         self.log_message("Application initialized")
+        self.log_message("Air monitor checkbox initialized")
         self.log_message("Hold down 'Push to Text' button to record audio")
         print("MainWindow __init__ completed")
 
@@ -543,9 +580,204 @@ class MainWindow(QMainWindow):
             self.device_list_layout.addWidget(lbl)
             self.log_message(f"Error loading audio devices: {str(e)}")
     
+    def populate_output_devices(self):
+        """Populate the output device combo box"""
+        try:
+            devices_info = get_platform_devices_info(self.p)
+            output_devices = devices_info.get("output", [])
+            
+            self.output_device_combo.clear()
+            
+            if not output_devices:
+                self.output_device_combo.addItem("No output devices found", -1)
+                self.log_message("No output devices found")
+                return
+            
+            # Get default output device
+            default_devices = get_default_devices(self.p)
+            default_output = default_devices.get("output")
+            default_name = default_output.get("name", "") if default_output else ""
+            default_index = -1
+            
+            for device in output_devices:
+                device_name = device.get("name", "Unknown Device")
+                device_index = device.get("index", -1)
+                tooltip = f"Index: {device_index} | Host API: {device.get('hostApiName', '')} | DefaultRate: {int(device.get('defaultSampleRate', 44100))} Hz"
+                
+                self.output_device_combo.addItem(device_name, device_index)
+                self.output_device_combo.setItemData(self.output_device_combo.count() - 1, tooltip, Qt.ToolTipRole)
+                
+                # Mark the default device
+                if device_name == default_name:
+                    default_index = self.output_device_combo.count() - 1
+            
+            # Select the default device
+            if default_index >= 0:
+                self.output_device_combo.setCurrentIndex(default_index)
+            
+            self.log_message(f"Found {len(output_devices)} output devices")
+            
+        except Exception as e:
+            self.output_device_combo.clear()
+            self.output_device_combo.addItem("Error loading output devices", -1)
+            self.log_message(f"Error loading output audio devices: {str(e)}")
+    
     def on_device_selection_changed(self):
         """Handle device selection change"""
         self.restart_audio_monitoring()
+    
+    def on_air_monitor_changed(self, state):
+        """Handle air monitor checkbox state change"""
+        print(f"Air monitor checkbox changed: state={state}, Qt.Checked={Qt.Checked}")
+        
+        # state is 2 for checked, 0 for unchecked
+        is_checked = state == 2
+        self.log_message(f"Air monitor checkbox changed to: {'ON' if is_checked else 'OFF'}")
+        
+        if is_checked:
+            print("Starting air monitoring...")
+            self.start_air_monitoring()
+        else:
+            print("Stopping air monitoring...")
+            self.stop_air_monitoring()
+    
+    def start_air_monitoring(self):
+        """Start air monitoring - mix input audio and output to selected device"""
+        if self.is_air_monitoring:
+            return
+        
+        # Get selected output device
+        output_device_id = self.output_device_combo.currentData()
+        if output_device_id is None or output_device_id == -1:
+            self.log_message("No valid output device selected for air monitoring")
+            self.air_monitor_checkbox.setChecked(False)
+            return
+        
+        # Get selected input devices
+        selected_inputs = self.get_selected_device_ids()
+        if not selected_inputs:
+            self.log_message("No input devices selected for air monitoring")
+            self.air_monitor_checkbox.setChecked(False)
+            return
+        
+        try:
+            # Open output stream
+            self.output_device_id = output_device_id
+            print(f"Opening output stream: device_id={output_device_id}, rate={self.mixing_sample_rate}, channels={self.mixing_channels}")
+            
+            self.output_stream = self.p.open(
+                format=pyaudio.paInt16,
+                channels=self.mixing_channels,
+                rate=self.mixing_sample_rate,
+                output=True,
+                output_device_index=output_device_id,
+                frames_per_buffer=1024
+            )
+            
+            # Start the output stream
+            self.output_stream.start_stream()
+            
+            self.is_air_monitoring = True
+            self.log_message(f"Air monitoring started - Output device: {self.output_device_combo.currentText()}")
+            print(f"Air monitoring started successfully")
+            
+        except Exception as e:
+            self.log_message(f"Failed to start air monitoring: {str(e)}")
+            print(f"Failed to start air monitoring: {str(e)}")
+            self.air_monitor_checkbox.setChecked(False)
+    
+    def stop_air_monitoring(self):
+        """Stop air monitoring"""
+        if not self.is_air_monitoring:
+            return
+        
+        self.is_air_monitoring = False
+        
+        if self.output_stream:
+            try:
+                self.output_stream.stop_stream()
+                self.output_stream.close()
+            except Exception:
+                pass
+            self.output_stream = None
+        
+        self.output_device_id = None
+        self.log_message("Air monitoring stopped")
+    
+    def mix_audio_streams(self, input_streams_data):
+        """Mix multiple input audio streams by averaging"""
+        if not input_streams_data:
+            print("Mix: no input streams data")
+            return None
+        
+        print(f"Mix: processing {len(input_streams_data)} input streams")
+        
+        # Convert all audio data to the same format and sample rate
+        normalized_streams = []
+        target_length = 0
+        
+        for i, (audio_data, sample_rate, channels) in enumerate(input_streams_data):
+            if audio_data is None:
+                print(f"Mix: stream {i} has no audio data")
+                continue
+            
+            print(f"Mix: stream {i} - {len(audio_data)} samples, {sample_rate}Hz, {channels} channels")
+            
+            # Ensure audio_data is float for processing
+            if audio_data.dtype != np.float32:
+                audio_data = audio_data.astype(np.float32)
+            
+            # Resample if necessary (simplified - in practice would need proper resampling)
+            if sample_rate != self.mixing_sample_rate:
+                # Simple approach: repeat or subsample
+                ratio = self.mixing_sample_rate / sample_rate
+                if ratio != 1.0:
+                    new_length = int(len(audio_data) * ratio)
+                    audio_data = np.interp(
+                        np.linspace(0, len(audio_data) - 1, new_length),
+                        np.arange(len(audio_data)),
+                        audio_data
+                    )
+                    print(f"Mix: resampled stream {i} from {len(input_streams_data[i][0])} to {len(audio_data)} samples")
+            
+            # Convert to stereo if needed
+            if channels == 1 and self.mixing_channels == 2:
+                # Duplicate mono to stereo
+                audio_data = np.repeat(audio_data, 2)
+                print(f"Mix: converted stream {i} from mono to stereo")
+            elif channels == 2 and self.mixing_channels == 1:
+                # Mix stereo to mono
+                audio_data = audio_data.reshape(-1, 2).mean(axis=1)
+                print(f"Mix: converted stream {i} from stereo to mono")
+            
+            normalized_streams.append(audio_data)
+            target_length = max(target_length, len(audio_data))
+        
+        if not normalized_streams:
+            print("Mix: no valid normalized streams")
+            return None
+        
+        print(f"Mix: target length {target_length}, {len(normalized_streams)} streams")
+        
+        # Pad shorter streams to target length
+        for i in range(len(normalized_streams)):
+            if len(normalized_streams[i]) < target_length:
+                padding = target_length - len(normalized_streams[i])
+                normalized_streams[i] = np.pad(normalized_streams[i], (0, padding), 'constant')
+        
+        # Average the streams
+        mixed_audio = np.mean(normalized_streams, axis=0)
+        
+        # Apply some gain to make it audible
+        mixed_audio = mixed_audio * 2.0
+        
+        # Ensure the output doesn't clip
+        mixed_audio = np.clip(mixed_audio, -32767, 32767)
+        
+        result = mixed_audio.astype(np.int16)
+        print(f"Mix: output {len(result)} samples, range [{result.min()}, {result.max()}]")
+        
+        return result
     
     def delayed_audio_monitoring(self):
         """Start audio monitoring after a delay to avoid blocking initialization"""
@@ -584,13 +816,38 @@ class MainWindow(QMainWindow):
     
     def process_audio_data(self):
         """Process audio data from monitoring thread - called by timer on main thread"""
+        input_streams_data = []
+        
         # Iterate over audio devices and process available data
         for device_id, device in list(self.audio_devices.items()):
             if device.mode == 'monitoring' and device.latest_audio_data is not None:
                 audio_data = device.latest_audio_data
                 sample_rate = device.latest_sample_rate
                 device.latest_audio_data = None
+                
+                # Update spectrum visualization
                 self.update_spectrum_safe(device_id, audio_data, sample_rate)
+                
+                # Collect for air monitoring if enabled
+                if self.is_air_monitoring:
+                    print(f"Air monitor: collecting from device {device_id}, {len(audio_data)} samples")
+                    input_streams_data.append((audio_data, sample_rate, device.channels))
+        
+        # Mix and output audio if air monitoring is enabled
+        if self.is_air_monitoring and input_streams_data and self.output_stream:
+            try:
+                mixed_audio = self.mix_audio_streams(input_streams_data)
+                if mixed_audio is not None:
+                    # Write to output stream
+                    audio_bytes = mixed_audio.tobytes()
+                    if len(audio_bytes) > 0:
+                        self.output_stream.write(audio_bytes, exception_on_underflow=False)
+                        print(f"Air monitor: wrote {len(audio_bytes)} bytes to output")
+                else:
+                    print("Air monitor: mixed_audio is None")
+            except Exception as e:
+                print(f"Air monitoring output error: {e}")
+                self.log_message(f"Air monitoring output error: {e}")
     
     def update_spectrum(self, device_id, audio_data, sample_rate):
         """Update spectrum - called from audio thread, emit signal for thread safety"""
@@ -967,6 +1224,10 @@ class MainWindow(QMainWindow):
         """Clean up when closing the application"""
         if self.is_recording:
             self.stop_recording()
+        
+        # Stop air monitoring
+        if self.is_air_monitoring:
+            self.stop_air_monitoring()
         
         # Stop all audio devices
         for device in list(self.audio_devices.values()):
