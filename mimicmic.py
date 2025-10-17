@@ -88,9 +88,20 @@ def render_spectrogram_image(
     vmax: float,
 ) -> Path:
     figure, axis = plt.subplots(figsize=(10, 4))
-    freqs_plot = state.freqs
-    times_plot = state.times
-    power_plot = state.power_db.T
+    freqs_plot = state.freqs.copy()
+    times_plot = state.times.copy()
+    power_plot = state.power_db.T.copy()
+    if freqs_plot.size > 0 and freq_limit < freqs_plot[-1]:
+        cutoff_idx = np.searchsorted(freqs_plot, freq_limit, side='right')
+        freqs_plot = freqs_plot[:cutoff_idx]
+        power_plot = power_plot[:, :cutoff_idx] if power_plot.size else power_plot
+        if freqs_plot.size == 0:
+            freqs_plot = np.array([freq_limit])
+            power_plot = np.full((power_plot.shape[0], 1), vmin)
+        elif freqs_plot[-1] < freq_limit:
+            freqs_plot = np.append(freqs_plot, freq_limit)
+            last_col = power_plot[:, -1:] if power_plot.size else np.full((power_plot.shape[0], 1), vmin)
+            power_plot = np.hstack([power_plot, last_col])
     if freqs_plot.size > 0 and freqs_plot[-1] < freq_limit:
         freqs_plot = np.append(freqs_plot, freq_limit)
         pad_column = np.full((power_plot.shape[0], 1), vmin)
@@ -126,7 +137,7 @@ def aggregate_limits() -> Optional[tuple[float, float, float, float]]:
     if not states:
         return None
     time_limit = max(state.max_time for state in states)
-    freq_limit = max(state.max_freq for state in states)
+    freq_limit = min(8000.0, max(state.max_freq for state in states))
     vmin = min(state.power_min for state in states)
     vmax = max(state.power_max for state in states)
     if np.isclose(vmin, vmax):
