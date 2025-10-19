@@ -216,12 +216,25 @@ def render_log_mel_image(
         times_plot = np.append(times_plot, time_limit)
         pad_row = np.full((1, mel_power.shape[1]), vmin)
         mel_power = np.vstack([mel_power, pad_row])
-    mesh = axis.pcolormesh(mel_freqs, times_plot, mel_power, shading='auto', vmin=vmin, vmax=vmax)
-    axis.set_xlabel('Frequency [Hz]')
+    mel_axis = hz_to_mel(mel_freqs)
+    if mel_axis.size > 0 and mel_axis[0] > 0.0:
+        num_rows = mel_power.shape[0]
+        if mel_power.shape[1] > 0:
+            first_col = mel_power[:, :1]
+        else:
+            first_col = np.full((num_rows, 1), vmin)
+        mel_power = np.hstack([first_col, mel_power])
+        mel_axis = np.insert(mel_axis, 0, 0.0)
+    mesh = axis.pcolormesh(mel_axis, times_plot, mel_power, shading='auto', vmin=vmin, vmax=vmax)
+    axis.set_xlabel('Mel')
     axis.set_ylabel('Time [s]')
     axis.set_title(f'{state.title} Log-Mel')
-    axis.set_xlim(0, max(freq_limit, 1e-9))
+    mel_limit = hz_to_mel(freq_limit)
+    mel_max = mel_axis[-1] if mel_axis.size > 0 else mel_limit
+    axis.set_xlim(0, max(mel_max, 1e-9))
     axis.set_ylim(0, max(time_limit, 1e-9))
+    secax = axis.secondary_xaxis('top', functions=(mel_to_hz, hz_to_mel))
+    secax.set_xlabel('Frequency [Hz]')
     figure.colorbar(mesh, ax=axis, label='Power (dB)')
     figure.tight_layout()
     previous_path = state.mel_image_path
