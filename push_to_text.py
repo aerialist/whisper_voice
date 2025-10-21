@@ -481,7 +481,7 @@ class MainWindow(QMainWindow):
         self.spectrum_widget.setTitle('Audio Frequency Spectrum')
         self.spectrum_widget.setMinimumHeight(200)
         self.spectrum_widget.setLogMode(x=True, y=False)
-        self.spectrum_widget.setXRange(np.log10(20), np.log10(20000))
+        self.spectrum_widget.setXRange(np.log10(50), np.log10(8000))
         self.spectrum_widget.setYRange(-110, 0)
         try:
             self.legend = self.spectrum_widget.addLegend()
@@ -858,7 +858,7 @@ class MainWindow(QMainWindow):
         """Update the frequency spectrum plot - runs on main GUI thread"""
         try:
             # Compute spectrum using utility function
-            freqs_filtered, magnitude_filtered = compute_audio_spectrum(audio_data, sample_rate)
+            freqs_filtered, magnitude_filtered = compute_audio_spectrum(audio_data, sample_rate, freq_min=50, freq_max=8000)
             
             if freqs_filtered is not None and magnitude_filtered is not None:
                 # Ensure curve exists for this device
@@ -1379,4 +1379,3 @@ if __name__ == "__main__":
         print(f"ERROR: {e}")
         import traceback
         traceback.print_exc()
-
