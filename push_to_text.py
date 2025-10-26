@@ -232,24 +232,28 @@ class AudioDevice:
         except Exception:
             return False
     
-    def save_to_recordings_folder(self):
-        """Save recorded audio to recordings folder with timestamp and device name"""
+    def save_to_recordings_folder(self, base_dir="recordings", timestamp=None):
+        """Persist recorded audio under recordings/<device_name>/<timestamp>.wav."""
         if not self.frames:
             return False, "No audio data to save"
         
         try:
             # Create recordings directory if it doesn't exist
-            recordings_dir = "recordings"
+            recordings_dir = base_dir
             if not os.path.exists(recordings_dir):
                 os.makedirs(recordings_dir)
             
-            # Generate filename with timestamp and device name
-            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            # Prepare sanitized device folder and timestamp-based filename
+            timestamp = timestamp or datetime.now().strftime("%Y%m%d%H%M%S")
             # Sanitize device name for filename
             safe_device_name = "".join(c for c in self.device_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
             safe_device_name = safe_device_name.replace(" ", "_")
-            filename = f"{timestamp}_{safe_device_name}.wav"
-            filepath = os.path.join(recordings_dir, filename)
+            if not safe_device_name:
+                safe_device_name = f"device_{self.device_id}"
+            device_dir = os.path.join(recordings_dir, safe_device_name)
+            os.makedirs(device_dir, exist_ok=True)
+            filename = f"{timestamp}.wav"
+            filepath = os.path.join(device_dir, filename)
             
             # Save the file
             wf = wave.open(filepath, 'wb')
@@ -392,6 +396,7 @@ class MainWindow(QMainWindow):
         self.session_results = []
         self._active_workers = set()
         self._procs = {}
+        self.current_session_timestamp = None
         
         # Air monitoring state
         self.is_air_monitoring = False
@@ -917,6 +922,7 @@ class MainWindow(QMainWindow):
 
         # Reset session results for a new recording session
         self.session_results = []
+        self.current_session_timestamp = None
 
         # Stop monitoring to avoid device conflicts
         self._stop_devices_by_mode('monitoring')
@@ -937,6 +943,7 @@ class MainWindow(QMainWindow):
 
         recording_devices = [d for d in self.audio_devices.values() if d.mode == 'recording']
         if recording_devices:
+            self.current_session_timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
             self.is_recording = True
             self._update_button_state(
                 text="Recording... (Click again to stop)",
@@ -1002,15 +1009,18 @@ class MainWindow(QMainWindow):
         if not any_frames:
             self.log_message("No audio data recorded")
             self.reset_button()
+            self.current_session_timestamp = None
             return
 
         # Save and transcribe each recorded device
         self.pending_transcriptions = 0
+        session_timestamp = self.current_session_timestamp or datetime.now().strftime("%Y%m%d%H%M%S")
+        self.current_session_timestamp = session_timestamp
         for device in stopped_devices:
             if not device.frames:
                 continue
             # Save to recordings folder first
-            success, result = device.save_to_recordings_folder()
+            success, result = device.save_to_recordings_folder(timestamp=session_timestamp)
             if success:
                 self.log_message(f"Audio saved to: {result}")
             else:
@@ -1133,11 +1143,18 @@ class MainWindow(QMainWindow):
             device_info = get_device_info_by_id(device_id, self.p) if device_id is not None else None
         except Exception:
             device_info = None
+        wave_file_entry = None
+        if saved_recording_path:
+            try:
+                wave_file_entry = os.path.relpath(saved_recording_path, start="recordings")
+            except Exception:
+                wave_file_entry = os.path.basename(saved_recording_path)
+
         result_entry = {
             "device_info": device_info,
             "transcription": transcription_text,
             "transcription provider": "openai.whisper-1",
-            "wave file name": os.path.basename(saved_recording_path) if saved_recording_path else None,
+            "wave file name": wave_file_entry,
         }
         self.session_results.append(result_entry)
 
@@ -1198,7 +1215,7 @@ class MainWindow(QMainWindow):
                 recordings_dir = "recordings"
                 if not os.path.exists(recordings_dir):
                     os.makedirs(recordings_dir)
-                ts = datetime.now().strftime("%Y%m%d%H%M%S")
+                ts = self.current_session_timestamp or datetime.now().strftime("%Y%m%d%H%M%S")
                 json_path = os.path.join(recordings_dir, f"{ts}.json")
                 with open(json_path, "w", encoding="utf-8") as f:
                     json.dump(self.session_results, f, ensure_ascii=False, indent=2)
@@ -1212,6 +1229,7 @@ class MainWindow(QMainWindow):
             self.reset_button()
             # Now that transcription work is done, resume audio monitoring
             self.start_audio_monitoring()
+            self.current_session_timestamp = None
 
     def _processing_heartbeat_tick(self):
         """Emit a periodic log while transcriptions are pending."""
