@@ -2,6 +2,7 @@
 recordings/
 tmp/
 test/
+pretrained/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
